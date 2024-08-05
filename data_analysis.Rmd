@@ -1,0 +1,1488 @@
+---
+title: "Summer project"
+author: "Lsh2300488 CHAN HEI YEUNG, Leon"
+output: pdf_document
+---
+##importing of data and libraries 
+importing of libraries
+```{r}
+library(here)
+setwd(here())
+library(haven)
+library(lubridate)
+library(tableone) 
+library(ggplot2)
+library(survival)
+library(survminer)
+library(parallel)
+library(doParallel)
+library(timereg)
+library(matrixStats) 
+library(tidysmd)
+library(cobalt)
+library(multcomp)
+library(dplyr)
+```
+
+
+importing of the four data files 
+```{r}
+warfarin_ppi<-read_dta("warfarin_ppi.dta")
+doac_ppi<-read_dta("doac_ppi.dta")
+aurum_hes_gi_bleed_dx<-read_dta("aurum_hes_gi_bleed_dx.dta")
+aurum_gi_bleed_dx<-read_dta("aurum_gi_bleed_dx.dta")
+
+```
+
+
+## intial data cleaning 
+general data cleaning, fusing the outcome data tgt 
+```{r}
+aurum_gi_bleed_dx$source<-as.factor("aurum")
+aurum_hes_gi_bleed_dx$source<-as.factor("hes")
+aurum_hes_gi_bleed_dx<-aurum_hes_gi_bleed_dx[,-2]
+colnames(aurum_hes_gi_bleed_dx)
+colnames(aurum_gi_bleed_dx)
+names(aurum_hes_gi_bleed_dx) <- c("patid","term","incident","obsdate","source")
+all_outcome<-rbind(aurum_hes_gi_bleed_dx,aurum_gi_bleed_dx)
+all_outcome <- all_outcome %>% filter(between(obsdate, as.Date("1920-01-01"), as.Date("2023-01-01")))
+```
+making the factors factors
+```{r}
+summary(doac_ppi)
+
+doac_ppi$smokstatus<-as.factor(doac_ppi$smokstatus)
+doac_ppi$bmicat<-as.factor(doac_ppi$bmicat)
+doac_ppi$alcohol<-as.factor(doac_ppi$alcohol)
+doac_ppi$imd<-as.factor(doac_ppi$imd)
+doac_ppi$region<-as.factor(doac_ppi$region)
+doac_ppi$dm_insulin_base<-as.factor(doac_ppi$dm_insulin_base)
+doac_ppi$doac_type<-as.factor(doac_ppi$doac_type)
+
+summary(warfarin_ppi)
+
+warfarin_ppi$smokstatus<-as.factor(warfarin_ppi$smokstatus)
+warfarin_ppi$bmicat<-as.factor(warfarin_ppi$bmicat)
+warfarin_ppi$alcohol<-as.factor(warfarin_ppi$alcohol)
+warfarin_ppi$imd<-as.factor(warfarin_ppi$imd)
+warfarin_ppi$region<-as.factor(warfarin_ppi$region)
+warfarin_ppi$dm_insulin_base<-as.factor(warfarin_ppi$dm_insulin_base)
+
+```
+
+
+filtering of the apprioate incidents 
+```{r}
+all_his<-all_outcome %>% filter(incident==0)
+all_incident<-all_outcome %>% filter (incident==1)
+
+
+terms<-unique(all_incident$term)
+write.csv(terms,file="codelist.csv")
+terms<-read.csv("codelist_bleed_type.csv")
+terms<-terms %>% select(x,classification)
+colnames(terms)[1]<-"term"
+all_incident<-all_incident %>% left_join(terms,by="term") %>%filter(classification==c("U","L","B")) %>% select(-classification) 
+all_incident_HES<-all_incident %>% filter(source=="hes")
+```
+
+
+#intial data joining, GI bleed hx
+We then obtain the GI bleed history of the patient 
+```{r}
+
+doac_ppi_his<-doac_ppi %>% select(patid,indexdate) %>% inner_join(all_outcome,by="patid") %>% group_by(patid,indexdate) %>% mutate(rank=rank(obsdate)) %>%filter(rank==1) %>%  filter(obsdate<indexdate)
+doac_ppi_his<-doac_ppi_his %>% select(patid,indexdate) %>% mutate(GI_bleed=1)
+doac_ppi<-doac_ppi %>% 
+  left_join(doac_ppi_his,by=c("patid","indexdate")) %>% 
+  mutate(GI_bleed=case_when(is.na(GI_bleed)~0, TRUE~1))
+
+
+warfarin_ppi_his<-warfarin_ppi %>% select(patid,indexdate) %>% inner_join(all_outcome,by="patid") %>% group_by(patid,indexdate) %>% mutate(rank=rank(obsdate)) %>%filter(rank==1) %>%  filter(obsdate<indexdate)
+warfarin_ppi_his<-warfarin_ppi_his %>% select(patid,indexdate) %>% mutate(GI_bleed=1)
+warfarin_ppi<-warfarin_ppi %>% 
+  left_join(warfarin_ppi_his,by=c("patid","indexdate")) %>% 
+  mutate(GI_bleed=case_when(is.na(GI_bleed)~0, TRUE~1))
+
+
+```
+
+#outcome generation
+we then obtain the data concerning the outcome of the data. 
+```{r}
+doac_ppi_bleed<-doac_ppi %>% filter(GI_bleed==1) %>% select(patid,indexdate,dod,enddate)
+doac_ppi_no_bleed <-doac_ppi %>% filter(GI_bleed==0) %>% select(patid,indexdate,dod,enddate)
+#for no bleeding, take regardless of source
+doac_ppi_no_bleed_outcome <-doac_ppi_no_bleed %>% inner_join(all_incident,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>% group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+#for bleeding, take only HES
+doac_ppi_bleed_outcome<-doac_ppi_bleed %>% inner_join(all_incident_HES,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>%group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+
+doac_ppi_bleed<-rbind(doac_ppi_bleed_outcome,doac_ppi_no_bleed_outcome)
+
+
+warfarin_ppi_bleed<-warfarin_ppi %>% filter(GI_bleed==1) %>% select(patid,indexdate,dod,enddate)
+warfarin_ppi_no_bleed <-warfarin_ppi %>% filter(GI_bleed==0) %>% select(patid,indexdate,dod,enddate)
+#for no bleeding, take regardless of source
+warfarin_ppi_no_bleed_outcome <-warfarin_ppi_no_bleed %>% inner_join(all_incident,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>% group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+#for bleeding, take only HES
+warfarin_ppi_bleed_outcome<-warfarin_ppi_bleed %>% inner_join(all_incident_HES,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate)%>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>%group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+
+warfarin_ppi_bleed<-rbind(warfarin_ppi_bleed_outcome,warfarin_ppi_no_bleed_outcome)
+
+
+```
+
+
+combining the results and computing the survival time 
+```{r}
+doac_ppi_outcome<-doac_ppi %>% left_join(doac_ppi_bleed,by=c("patid","indexdate","enddate"))
+doac_ppi_outcome_yes<-doac_ppi_outcome %>% filter(incident==1)
+doac_ppi_outcome_no<-doac_ppi_outcome %>% filter(is.na(incident)) %>% mutate(incident=0) %>% mutate(survival_time=enddate-indexdate)
+doac_ppi_outcome<-rbind(doac_ppi_outcome_yes,doac_ppi_outcome_no)
+
+
+warfarin_ppi_outcome<-warfarin_ppi %>% left_join(warfarin_ppi_bleed,by=c("patid","indexdate","enddate"))
+warfarin_ppi_outcome_yes<-warfarin_ppi_outcome %>% filter(incident==1)
+warfarin_ppi_outcome_no<-warfarin_ppi_outcome %>% filter(is.na(incident)) %>% mutate(incident=0) %>% mutate(survival_time=enddate-indexdate)
+warfarin_ppi_outcome<-rbind(warfarin_ppi_outcome_yes,warfarin_ppi_outcome_no)
+
+
+
+```
+
+
+
+##table one creation 
+we then proceed to the creation of table one 
+
+```{r}
+varstofactor <- c("male","smokstatus","bmicat","alcohol","ckd_base","imd","copd_base","hf_base","ihd_base","peptic_ulcer_base","pad_base","af_base","vte_base","all_bleed_base","stroke_tia_base","ischaemic_stroke_base","hypertension_base","liver_disease_base","MI_base","dm_insulin_base","GI_bleed","aspirin","antiplatelet","antidepressant","anticonvulsant","nsaid","oralsteroid","all_macrolide","region","polypharmacy_main","doac_type")  
+table1vars <- c("age_index","male","smokstatus","bmicat","alcohol","systolic_bp","diastolic_bp","ckd_base","imd","copd_base","hf_base","ihd_base","peptic_ulcer_base","pad_base","af_base","vte_base","all_bleed_base","stroke_tia_base","ischaemic_stroke_base","hypertension_base","liver_disease_base","MI_base","dm_insulin_base","GI_bleed","aspirin","antiplatelet","antidepressant","anticonvulsant","nsaid","oralsteroid","all_macrolide","gpvisit_num","region","polypharmacy_main","doac_type") 
+doac_total_table_one<-CreateTableOne(vars = table1vars, data = doac_ppi, factorVars = varstofactor, includeNA = TRUE, test = FALSE) 
+print(doac_total_table_one)
+doac_total_table_one<-CreateTableOne(vars = table1vars, data = doac_ppi, strata = c("exposure"), factorVars = varstofactor, includeNA = TRUE, test = FALSE) 
+print(doac_total_table_one)
+covs <- subset(doac_ppi, select = table1vars)
+bal.tab(exposure~covs,data=doac_ppi,
+        disp = c("means", "sds"), 
+        stats = c("mean.diffs"))
+
+```
+
+Similarly for warfarin
+```{r}
+varstofactor <- c("male","smokstatus","bmicat","alcohol","ckd_base","imd","copd_base","hf_base","ihd_base","peptic_ulcer_base","pad_base","af_base","vte_base","all_bleed_base","stroke_tia_base","ischaemic_stroke_base","hypertension_base","liver_disease_base","MI_base","dm_insulin_base","GI_bleed","aspirin","antiplatelet","antidepressant","anticonvulsant","nsaid","oralsteroid","all_macrolide","region","polypharmacy_main")  
+table1vars <- c("age_index","male","smokstatus","bmicat","alcohol","systolic_bp","diastolic_bp","ckd_base","imd","copd_base","hf_base","ihd_base","peptic_ulcer_base","pad_base","af_base","vte_base","all_bleed_base","stroke_tia_base","ischaemic_stroke_base","hypertension_base","liver_disease_base","MI_base","dm_insulin_base","GI_bleed","aspirin","antiplatelet","antidepressant","anticonvulsant","nsaid","oralsteroid","all_macrolide","gpvisit_num","region","polypharmacy_main") 
+warfarin_total_table_one<-CreateTableOne(vars = table1vars, data = warfarin_ppi, factorVars = varstofactor, includeNA = TRUE, test = FALSE) 
+print(warfarin_total_table_one)
+warfarin_total_table_one<-CreateTableOne(vars = table1vars, data = warfarin_ppi, strata = c("exposure"), factorVars = varstofactor, includeNA = TRUE, test = FALSE) 
+print(warfarin_total_table_one)
+covs <- subset(warfarin_ppi, select = table1vars)
+bal.tab(exposure~covs,data=warfarin_ppi,
+        disp = c("means", "sds"), 
+        stats = c("mean.diffs"))
+
+```
+
+
+
+
+
+#basic summary statistics concerning survival
+more concerning summnary statistics, concerning that of survival status of 2 groups 
+```{r}
+
+sum(doac_ppi_outcome$incident)
+as.numeric(sum(doac_ppi_outcome$survival_time))/365.25
+sum(doac_ppi_outcome$incident)/as.numeric(sum(doac_ppi_outcome$incident))*1000*365.25
+sum(doac_ppi_outcome$incident[doac_ppi_outcome$exposure==1])
+as.numeric(sum(doac_ppi_outcome$survival_time[doac_ppi_outcome$exposure==1]))/365.25
+sum(doac_ppi_outcome$incident[doac_ppi_outcome$exposure==1])/as.numeric(sum(doac_ppi_outcome$survival_time[doac_ppi_outcome$exposure==1]))*1000*365.25
+sum(doac_ppi_outcome$incident[doac_ppi_outcome$exposure==0])
+as.numeric(sum(doac_ppi_outcome$survival_time[doac_ppi_outcome$exposure==0]))/365.25
+sum(doac_ppi_outcome$incident[doac_ppi_outcome$exposure==0])/as.numeric(sum(doac_ppi_outcome$survival_time[doac_ppi_outcome$exposure==0]))*1000*365.25
+
+doac_ppi_unadj_survfit<-survfit(Surv(doac_ppi_outcome$survival_time, doac_ppi_outcome$incident) ~ doac_ppi_outcome$exposure, data = doac_ppi_outcome)
+summary(doac_ppi_unadj_survfit,conf.int = 0.99)
+ggsurvplot(  doac_ppi_unadj_survfit,
+  data = doac_ppi_outcome,
+  size = 1,                 # change line size
+  palette =
+    c("red", "blue"),# custom color palettes
+  legend.labs=c("doac only","doac+ppi"),
+  conf.int = TRUE,          # Add confidence interval
+      # Change legend labels
+  title="KM-plot of unadjusted incidence for Doac group",
+  xlim=c(0,1000),
+  ylim=c(0.85,1)
+)
+doac_ppi_unadj_survfit<-coxph(Surv(doac_ppi_outcome$survival_time, doac_ppi_outcome$incident) ~ doac_ppi_outcome$exposure, data = doac_ppi_outcome)
+summary(doac_ppi_unadj_survfit,conf.int = 0.99)
+doac_ppi_semi_adj_survfit<-coxph(Surv(doac_ppi_outcome$survival_time, doac_ppi_outcome$incident) ~ doac_ppi_outcome$exposure+doac_ppi_outcome$age_index+doac_ppi_outcome$male, data = doac_ppi_outcome)
+
+summary(doac_ppi_semi_adj_survfit,conf.int = 0.99)
+summary_doac_weighted<-summary(doac_ppi_semi_adj_survfit)
+
+
+
+```
+
+```{r}
+
+sum(warfarin_ppi_outcome$incident)
+as.numeric(sum(warfarin_ppi_outcome$survival_time))/365.25
+sum(warfarin_ppi_outcome$incident)/as.numeric(sum(warfarin_ppi_outcome$incident))*1000*365.25
+sum(warfarin_ppi_outcome$incident[warfarin_ppi_outcome$exposure==1])
+as.numeric(sum(warfarin_ppi_outcome$survival_time[warfarin_ppi_outcome$exposure==1]))/365.25
+sum(warfarin_ppi_outcome$incident[warfarin_ppi_outcome$exposure==1])/as.numeric(sum(warfarin_ppi_outcome$survival_time[warfarin_ppi_outcome$exposure==1]))*1000*365.25
+sum(warfarin_ppi_outcome$incident[warfarin_ppi_outcome$exposure==0])
+as.numeric(sum(warfarin_ppi_outcome$survival_time[warfarin_ppi_outcome$exposure==0]))/365.25
+sum(warfarin_ppi_outcome$incident[warfarin_ppi_outcome$exposure==0])/as.numeric(sum(warfarin_ppi_outcome$survival_time[warfarin_ppi_outcome$exposure==0]))*1000*365.25
+
+warfarin_ppi_unadj_survfit<-survfit(Surv(warfarin_ppi_outcome$survival_time, warfarin_ppi_outcome$incident) ~ warfarin_ppi_outcome$exposure, data = warfarin_ppi_outcome)
+summary(warfarin_ppi_unadj_survfit,conf.int = 0.99)
+ggsurvplot(
+  warfarin_ppi_unadj_survfit,
+  data = warfarin_ppi_outcome,
+  size = 1,                 # change line size
+  palette =
+    c("red", "blue"),# custom color palettes
+  legend.labs=c("doac only","doac+ppi"),
+  conf.int = TRUE,    # Change legend labels
+  title="KM-plot of unadjusted incidence for Warfarin group",
+  xlim=c(0,1000),
+  ylim=c(0.85,1)
+)
+
+warfarin_ppi_unadj_survfit<-coxph(Surv(warfarin_ppi_outcome$survival_time, warfarin_ppi_outcome$incident) ~ warfarin_ppi_outcome$exposure, data = warfarin_ppi_outcome)
+
+summary(warfarin_ppi_unadj_survfit,conf.int = 0.99)
+
+warfarin_ppi_semi_adj_survfit<-coxph(Surv(warfarin_ppi_outcome$survival_time, warfarin_ppi_outcome$incident) ~ warfarin_ppi_outcome$exposure+warfarin_ppi_outcome$age_index+warfarin_ppi_outcome$male, data = warfarin_ppi_outcome)
+
+summary(warfarin_ppi_semi_adj_survfit,conf.int = 0.99)
+summary_doac_weighted<-summary(warfarin_ppi_semi_adj_survfit)
+```
+
+
+
+
+
+##PS generation
+hence, we then proceeed to the propensity score generation for the models:
+```{r}
+
+doac_PS_model <- glm(exposure
+                     ~age_index+
+                       as.factor(male)+
+                   as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= doac_ppi_outcome) 
+# Display model coefficients
+summary(doac_PS_model)
+doac_ppi_outcome$PS <- doac_PS_model %>% predict(doac_ppi_outcome,  type = "response") 
+doac_ppi_complete<-doac_ppi_outcome[!is.na(doac_ppi_outcome$PS),]
+hist(doac_ppi_complete$PS[doac_ppi_complete$exposure==1],main="distribution of PS score for PPI+Doac group",xlab="PS score for PPI+Doac group")
+hist(doac_ppi_complete$PS[doac_ppi_complete$exposure==0],main="distribution of PS score for Doac group",xlab="PS score for Doac group")
+summary(doac_ppi_complete$PS[doac_ppi_complete$exposure==1])
+summary(doac_ppi_complete$PS[doac_ppi_complete$exposure==0])
+
+```
+
+```{r}
+
+
+warfarin_PS_model <- glm(exposure
+                     ~age_index+
+                       as.factor(male)+
+                   as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= warfarin_ppi_outcome) 
+# Display model coefficients
+summary(warfarin_PS_model)
+warfarin_ppi_outcome$PS <- warfarin_PS_model %>% predict(warfarin_ppi_outcome,  type = "response") 
+warfarin_ppi_complete<-warfarin_ppi_outcome[!is.na(warfarin_ppi_outcome$PS),]
+hist(warfarin_ppi_complete$PS[warfarin_ppi_complete$exposure==1],main="distribution of PS score for PPI+Warfarin group",xlab="PS score for PPI+Warfarin group")
+hist(warfarin_ppi_complete$PS[warfarin_ppi_complete$exposure==0],main="distribution of PS score for Warfarin group",xlab="PS score for Warfarin group")
+summary(warfarin_ppi_complete$PS[warfarin_ppi_complete$exposure==1])
+summary(warfarin_ppi_complete$PS[warfarin_ppi_complete$exposure==0])
+
+``` 
+`##trimming of the samples 
+we then proceed to the trimming of the samples 
+the logic is based on the fact that both had to be exchangeable,hence both had to be within the range of each other 
+```{r}
+doac_ppi_complete_exposure_range<-quantile(doac_ppi_complete$PS[doac_ppi_complete$exposure==1],c(0.05,0.95))
+
+doac_ppi_control_trimmed<-doac_ppi_complete %>% filter(exposure==0) %>% filter(between(PS,doac_ppi_complete_exposure_range[1],doac_ppi_complete_exposure_range[2]))
+doac_ppi_complete_control_range<-quantile(doac_ppi_complete$PS[doac_ppi_complete$exposure==0],c(0.05,0.95))
+doac_ppi_exposure_trimmed<-doac_ppi_complete %>% filter(exposure==1) %>% filter(between(PS,doac_ppi_complete_control_range[1],doac_ppi_complete_control_range[2]))
+                                                                                
+doac_ppi_trimmed<-rbind(doac_ppi_exposure_trimmed,doac_ppi_control_trimmed)
+```
+similarly, repeat for that of warfarin group
+```{r}
+
+warfarin_ppi_complete_exposure_range<-quantile(warfarin_ppi_complete$PS[warfarin_ppi_complete$exposure==1],c(0.05,0.95))
+warfarin_ppi_complete_control_trimmed<-warfarin_ppi_complete %>% filter(exposure==0) %>% filter(between(PS,warfarin_ppi_complete_exposure_range[1],warfarin_ppi_complete_exposure_range[2]))
+warfarin_ppi_complete_control_range<-quantile(warfarin_ppi_complete$PS[warfarin_ppi_complete$exposure==0],c(0.05,0.95))
+warfarin_ppi_complete_control_range_exposure_trimmed<-warfarin_ppi_complete %>% filter(exposure==1) %>% filter(between(PS,warfarin_ppi_complete_control_range[1],warfarin_ppi_complete_control_range[2]))
+warfarin_ppi_trimmed<-rbind(warfarin_ppi_complete_control_trimmed,warfarin_ppi_complete_control_range_exposure_trimmed)
+
+
+warfarin_ppi_trimmed<-warfarin_ppi_trimmed %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+```
+
+
+##main group analysis
+
+```{r} 
+
+doac_ppi_trimmed<-doac_ppi_trimmed %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_doac <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = doac_ppi_trimmed, weights = doac_ppi_trimmed$weight)
+summary(weighted_cox_doac,conf.int = 0.99)
+summary_doac_weighted<-summary(weighted_cox_doac)
+summary_doac_weighted<-c(summary_doac_weighted$coefficient[1],summary_doac_weighted$coefficient[1,3])
+schoen_resid_doac <- cox.zph(weighted_cox_doac)
+print(schoen_resid_doac)
+plot(schoen_resid_doac[1])
+```
+
+
+
+
+
+```{r}
+
+
+warfarin_ppi_trimmed<-warfarin_ppi_trimmed %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_warfarin <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = warfarin_ppi_trimmed, weights = warfarin_ppi_trimmed$weight)
+summary(weighted_cox_warfarin,conf.int = 0.99)
+summary_warfarin_weighted<-summary(weighted_cox_warfarin)
+summary_warfarin_weighted<-c(summary_warfarin_weighted$coefficient[1],summary_warfarin_weighted$coefficient[1,3])
+schoen_resid_warfarin <- cox.zph(weighted_cox_warfarin)
+print(schoen_resid_warfarin)
+plot(schoen_resid_warfarin[1])
+```
+##distribution of covairates post weighting 
+
+
+##for doac 
+```{r}
+table1vars <- c("age_index","male","smokstatus","bmicat","alcohol","systolic_bp","diastolic_bp","ckd_base","imd","copd_base","hf_base","ihd_base","peptic_ulcer_base","pad_base","af_base","vte_base","all_bleed_base","stroke_tia_base","ischaemic_stroke_base","hypertension_base","liver_disease_base","MI_base","dm_insulin_base","GI_bleed","aspirin","antiplatelet","antidepressant","anticonvulsant","nsaid","oralsteroid","all_macrolide","gpvisit_num","region","polypharmacy_main","doac_type") 
+covs<-subset(doac_ppi_trimmed,select=table1vars)
+
+bal.tab(exposure~covs,data=doac_ppi_trimmed,
+        disp = c("means", "sds"), 
+        stats = c("mean.diffs"), 
+        weights=doac_ppi_trimmed$weight)
+
+
+```
+##for warfarin 
+```{r}
+table1vars <- c("age_index","male","smokstatus","bmicat","alcohol","systolic_bp","diastolic_bp","ckd_base","imd","copd_base","hf_base","ihd_base","peptic_ulcer_base","pad_base","af_base","vte_base","all_bleed_base","stroke_tia_base","ischaemic_stroke_base","hypertension_base","liver_disease_base","MI_base","dm_insulin_base","GI_bleed","aspirin","antiplatelet","antidepressant","anticonvulsant","nsaid","oralsteroid","all_macrolide","gpvisit_num","region","polypharmacy_main") 
+covs<-subset(warfarin_ppi_trimmed,select=table1vars)
+bal.tab(exposure~covs,data=warfarin_ppi_trimmed,
+        disp = c("means", "sds"), 
+        stats = c("mean.diffs"), 
+        weights=warfarin_ppi_trimmed$weight)
+```
+
+
+#subgroup analysis 
+
+
+##doac male and females 
+
+
+```{r}
+weighted_cox_doac_gender <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+I(exposure*male)+gpvisit_num+polypharmacy_main, data = doac_ppi_trimmed, weights = doac_ppi_trimmed$weight)
+summary(weighted_cox_doac_gender,conf.int = 0.99)
+wald_statistic <- 2 * (logLik(weighted_cox_doac_gender) - logLik(weighted_cox_doac))
+print(wald_statistic)
+1 - pchisq(wald_statistic, 1)
+
+
+
+
+lh <- glht(weighted_cox_doac_gender, linfct = t(c(1, 0,0, 1, 0,0)))
+summary(lh)
+confint(lh,level = 0.99)
+ci<-confint(lh,level = 0.99)
+exp(ci$confint)
+
+
+
+```
+
+##warfarin male and females 
+```{r}
+weighted_cox_warfarin_gender <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main+exposure:male, data = warfarin_ppi_trimmed, weights = warfarin_ppi_trimmed$weight)
+summary(weighted_cox_warfarin_gender,conf.int = 0.99)
+wald_statistic <- 2 * (logLik(weighted_cox_warfarin_gender) - logLik(weighted_cox_warfarin))
+print(wald_statistic)
+1 - pchisq(wald_statistic, 1)
+lh <- glht(weighted_cox_warfarin_gender, linfct = t(c(1, 0,0, 0, 0,1)))
+summary(lh)
+confint(lh,level = 0.99)
+ci<-confint(lh,level = 0.99)
+exp(ci$confint)
+```
+##doac age 
+```{r}
+doac_ppi_old<-doac_ppi_trimmed %>% mutate(old=ifelse(age_index>65,1,0))
+weighted_cox_doac_age <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+old+I(exposure*old)+gpvisit_num+polypharmacy_main, data = doac_ppi_old, weights = doac_ppi_old$weight)
+summary(weighted_cox_doac_age,conf.int = 0.99)
+wald_statistic <- 2 * (logLik(weighted_cox_doac_age) - logLik(weighted_cox_doac))
+print(wald_statistic)
+1 - pchisq(wald_statistic, 2)
+lh <- glht(weighted_cox_doac_age, linfct = t(c(1, 0,0,0, 1, 0,0)))
+summary(lh)
+confint(lh,level = 0.99)
+ci<-confint(lh,level = 0.99)
+exp(ci$confint)
+
+```
+
+##warfarin age
+```{r}
+warfarin_ppi_old<-warfarin_ppi_trimmed %>% mutate(old=ifelse(age_index>65,1,0))
+weighted_cox_warfarin_age <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+old+I(exposure*old)+gpvisit_num+polypharmacy_main, data = warfarin_ppi_old, weights = warfarin_ppi_old$weight)
+summary(weighted_cox_warfarin_age,conf.int = 0.99)
+wald_statistic <- 2 * (logLik(weighted_cox_warfarin_age) - logLik(weighted_cox_warfarin))
+print(wald_statistic)
+1 - pchisq(wald_statistic, 2)
+lh <- glht(weighted_cox_warfarin_age, linfct = t(c(1, 0,0,0, 1, 0,0)))
+summary(lh)
+confint(lh,level = 0.99)
+ci<-confint(lh,level = 0.99)
+exp(ci$confint)
+```
+
+##doac subtypes 
+
+```{r}
+doac_ppi_trimmed_type<-doac_ppi_trimmed %>% mutate(type1=case_when(
+  doac_type==1~1, TRUE ~0 
+)) %>% mutate(type2=case_when(
+  doac_type==2~1, TRUE ~0 
+)) %>% mutate(type3=case_when(
+  doac_type==3~1, TRUE ~0 
+)) %>% mutate(type4=case_when(
+  doac_type==4~1, TRUE ~0 
+)) %>% mutate(type5=case_when(
+  doac_type==5~1, TRUE ~0 
+))
+ 
+ 
+
+weighted_cox_doac_type_2 <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+type2+gpvisit_num+polypharmacy_main+exposure:type2, data = doac_ppi_trimmed_type, weights = doac_ppi_trimmed_type$weight)
+summary(weighted_cox_doac_type_2,conf.int = 0.99)
+wald_statistic <- 2 * (logLik(weighted_cox_doac_type_2) - logLik(weighted_cox_doac))
+print(wald_statistic)
+1 - pchisq(wald_statistic, 2)
+lh <- glht(weighted_cox_doac_type_2, linfct = t(c(1, 0,0,0, 0, 0,1)))
+summary(lh)
+confint(lh,level = 0.99)
+ci<-confint(lh,level = 0.99)
+exp(ci$confint)
+
+
+
+
+weighted_cox_doac_type_3 <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+type3+gpvisit_num+polypharmacy_main+exposure:type3, data = doac_ppi_trimmed_type, weights = doac_ppi_trimmed_type$weight)
+summary(weighted_cox_doac_type_3,conf.int = 0.99)
+wald_statistic <- 2 * (logLik(weighted_cox_doac_type_3) - logLik(weighted_cox_doac))
+print(wald_statistic)
+1 - pchisq(wald_statistic, 2)
+lh <- glht(weighted_cox_doac_type_3, linfct = t(c(1, 0,0,0, 0, 0,1)))
+summary(lh)
+confint(lh,level = 0.99)
+ci<-confint(lh,level = 0.99)
+exp(ci$confint)
+
+
+weighted_cox_doac_type_4 <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+type4+gpvisit_num+polypharmacy_main+exposure:type4, data = doac_ppi_trimmed_type, weights = doac_ppi_trimmed_type$weight)
+summary(weighted_cox_doac_type_4,conf.int = 0.99)
+wald_statistic <- 2 * (logLik(weighted_cox_doac_type_4) - logLik(weighted_cox_doac))
+print(wald_statistic)
+1 - pchisq(wald_statistic, 2)
+lh <- glht(weighted_cox_doac_type_4, linfct = t(c(1, 0,0,0,0, 0,1)))
+summary(lh)
+confint(lh,level = 0.99)
+ci<-confint(lh,level = 0.99)
+exp(ci$confint)
+
+
+weighted_cox_doac_type_5 <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+type5+gpvisit_num+polypharmacy_main+exposure:type5, data = doac_ppi_trimmed_type, weights = doac_ppi_trimmed_type$weight)
+summary(weighted_cox_doac_type_5,conf.int = 0.99)
+wald_statistic <- 2 * (logLik(weighted_cox_doac_type_5) - logLik(weighted_cox_doac))
+print(wald_statistic)
+1 - pchisq(wald_statistic, 2)
+lh <- glht(weighted_cox_doac_type_5, linfct = t(c(1, 0,0,0,0, 0,1)))
+summary(lh)
+confint(lh,level = 0.99)
+ci<-confint(lh,level = 0.99)
+exp(ci$confint)
+
+```
+```{r}
+###
+#doac_ppi_trimmed_type<-doac_ppi_trimmed
+#doac_ppi_trimmed_type<-doac_ppi_trimmed_type[doac_ppi_trimmed_type$doac_type!=1,]
+#doac_ppi_trimmed_type$doac_type<-relevel(doac_ppi_trimmed_type$doac_type, ref = "2")
+ 
+
+#weighted_cox_doac_type_2 <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+doac_type+exposure:doac_type+gpvisit_num+polypharmacy_main, data = doac_ppi_trimmed_type, weights = doac_ppi_trimmed_type$weight)
+#summary(weighted_cox_doac_type_2,conf.int = 0.99)
+#wald_statistic <- 2 * (logLik(weighted_cox_doac_type_2) - logLik(weighted_cox_doac))
+#print(wald_statistic)
+#1 - pchisq(wald_statistic, 2)
+###
+```
+
+
+
+
+
+
+##DOAC GI bleed and atrial fibrilation 
+
+```{r}
+
+weighted_cox_doac_af_base <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+af_base+gpvisit_num+polypharmacy_main+exposure:af_base , data = doac_ppi_trimmed, weights = doac_ppi_trimmed$weight)
+summary(weighted_cox_doac_af_base,conf.int = 0.99)
+wald_statistic <- 2 * (logLik(weighted_cox_doac_af_base) - logLik(weighted_cox_doac))
+print(wald_statistic)
+1 - pchisq(wald_statistic, 2)
+lh <- glht(weighted_cox_doac_af_base, linfct = t(c(1, 0,0,0, 0, 0,1)))
+summary(lh)
+confint(lh,level = 0.99)
+ci<-confint(lh,level = 0.99)
+exp(ci$confint)
+```
+
+```{r}
+weighted_cox_doac_GI_bleed <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+GI_bleed+gpvisit_num+polypharmacy_main+exposure:GI_bleed, data = doac_ppi_trimmed, weights = doac_ppi_trimmed$weight)
+summary(weighted_cox_doac_GI_bleed,conf.int = 0.99)
+wald_statistic <- 2 * (logLik(weighted_cox_doac_GI_bleed) - logLik(weighted_cox_doac))
+print(wald_statistic)
+1 - pchisq(wald_statistic, 2)
+lh <- glht(weighted_cox_doac_GI_bleed, linfct = t(c(1, 0,0,0, 0, 0,1)))
+summary(lh)
+confint(lh,level = 0.99)
+ci<-confint(lh,level = 0.99)
+exp(ci$confint)
+```
+##warfarin GI bleed andhistory of atrial fibrilation
+
+```{r}
+
+weighted_cox_warfarin_af_base <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+af_base+exposure:af_base+gpvisit_num+polypharmacy_main , data = warfarin_ppi_trimmed, weights = warfarin_ppi_trimmed$weight)
+summary(weighted_cox_warfarin_af_base,conf.int = 0.99)
+
+wald_statistic <- 2 * (logLik(weighted_cox_warfarin_af_base) - logLik(weighted_cox_warfarin))
+print(wald_statistic)
+1 - pchisq(wald_statistic, 2)
+lh <- glht(weighted_cox_warfarin_af_base, linfct = t(c(1, 0,0,0, 1, 0,0)))
+summary(lh)
+confint(lh,level = 0.99)
+ci<-confint(lh,level = 0.99)
+exp(ci$confint)
+```
+
+```{r}
+weighted_cox_warfarin_GI_bleed <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+GI_bleed+gpvisit_num+polypharmacy_main+exposure:GI_bleed, data = warfarin_ppi_trimmed, weights = warfarin_ppi_trimmed$weight)
+summary(weighted_cox_warfarin_GI_bleed,conf.int = 0.99)
+
+wald_statistic <- 2 * (logLik(weighted_cox_warfarin_GI_bleed) - logLik(weighted_cox_warfarin))
+print(wald_statistic)
+1 - pchisq(wald_statistic, 2)
+lh <- glht(weighted_cox_warfarin_af_base, linfct = t(c(1, 0,0,0, 0, 0,1)))
+summary(lh)
+confint(lh,level = 0.99)
+ci<-confint(lh,level = 0.99)
+exp(ci$confint)
+```
+
+
+
+##Sensitivity analysis. 
+There are 2 sensitivity analysis concerning how the cutoff time is defined. 
+firstly, is concerning the duration of effect.In here, we define that the duration of effect is 0 (ie the drug effect immediately wears off as long as the followup time ends) hence only occurrences between the index date and enddate would be counted. We would explore that of having one week, 2 weeks, one month, and 3 months. 
+(note that the extension only applies to either 
+1. one week/ whatever the duration of effect is 
+2. until the switching occurs)
+#changed cutoff date 7 days
+```{r}
+sens_doac_7_days<-doac_ppi %>% group_by(patid) %>% mutate(count=n(),rank=rank(enddate)) %>% ungroup
+sens_doac_7_days_normal<-sens_doac_7_days %>% filter(count==1)
+sens_doac_7_days_normal_2<-sens_doac_7_days %>% filter(count!=1 & rank !=1)
+sens_doac_7_days_normal<-rbind(sens_doac_7_days_normal,sens_doac_7_days_normal_2)
+sens_doac_7_days_normal <- sens_doac_7_days_normal %>%
+  mutate(
+    enddate = case_when(
+      !is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(7)),
+      TRUE ~ as.Date(enddate) + days(7))
+  )
+
+
+
+sens_doac_7_days_double<-sens_doac_7_days %>% filter(count==2) %>% group_by(patid) %>% mutate(next_start_date = lead(indexdate)) %>% filter(rank==1) %>%   mutate(enddate =  case_when(!is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(7),next_start_date),
+TRUE ~ pmin(as.Date(enddate) + days(7),next_start_date))) 
+sens_doac_7_days_normal<-sens_doac_7_days_normal %>%
+  select(-count, -rank)
+sens_doac_7_days_double<-sens_doac_7_days_double %>%
+  select(-count, -rank, -next_start_date)
+
+sens_doac_7_days<-rbind(sens_doac_7_days_double,sens_doac_7_days_normal)
+
+```
+
+
+#other changed end dates
+Similarly, repeat for 14 days, 30 days and 90days 
+```{r}
+sens_doac_14_days<-doac_ppi %>% group_by(patid) %>% mutate(count=n(),rank=rank(enddate)) %>% ungroup
+sens_doac_14_days_normal<-sens_doac_14_days %>% filter(count==1)
+sens_doac_14_days_normal_2<-sens_doac_14_days %>% filter(count!=1 & rank !=1)
+sens_doac_14_days_normal<-rbind(sens_doac_14_days_normal,sens_doac_14_days_normal_2)
+sens_doac_14_days_normal <- sens_doac_14_days_normal %>%
+  mutate(
+    enddate = case_when(
+      !is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(14)),
+      TRUE ~ as.Date(enddate) + days(14))
+  )
+
+
+
+sens_doac_14_days_double<-sens_doac_14_days %>% filter(count==2) %>% group_by(patid) %>% mutate(next_start_date = lead(indexdate)) %>% filter(rank==1) %>%   mutate(enddate =  case_when(!is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(14),next_start_date),
+TRUE ~ pmin(as.Date(enddate) + days(14),next_start_date))) 
+sens_doac_14_days_normal<-sens_doac_14_days_normal %>%
+  select(-count, -rank)
+sens_doac_14_days_double<-sens_doac_14_days_double %>%
+  select(-count, -rank, -next_start_date)
+
+sens_doac_14_days<-rbind(sens_doac_14_days_double,sens_doac_14_days_normal)
+
+
+
+
+
+sens_doac_30_days<-doac_ppi %>% group_by(patid) %>% mutate(count=n(),rank=rank(enddate)) %>% ungroup
+sens_doac_30_days_normal<-sens_doac_30_days %>% filter(count==1)
+sens_doac_30_days_normal_2<-sens_doac_30_days %>% filter(count!=1 & rank !=1)
+sens_doac_30_days_normal<-rbind(sens_doac_30_days_normal,sens_doac_30_days_normal_2)
+sens_doac_30_days_normal <- sens_doac_30_days_normal %>%
+  mutate(
+    enddate = case_when(
+      !is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(30)),
+      TRUE ~ as.Date(enddate) + days(30))
+  )
+
+
+
+sens_doac_30_days_double<-sens_doac_30_days %>% filter(count==2) %>% group_by(patid) %>% mutate(next_start_date = lead(indexdate)) %>% filter(rank==1) %>%   mutate(enddate =  case_when(!is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(30),next_start_date),
+TRUE ~ pmin(as.Date(enddate) + days(30),next_start_date))) 
+sens_doac_30_days_normal<-sens_doac_30_days_normal %>%
+  select(-count, -rank)
+sens_doac_30_days_double<-sens_doac_30_days_double %>%
+  select(-count, -rank, -next_start_date)
+
+sens_doac_30_days<-rbind(sens_doac_30_days_double,sens_doac_30_days_normal)
+
+
+
+
+
+sens_doac_90_days<-doac_ppi %>% group_by(patid) %>% mutate(count=n(),rank=rank(enddate)) %>% ungroup
+sens_doac_90_days_normal<-sens_doac_90_days %>% filter(count==1)
+sens_doac_90_days_normal_2<-sens_doac_90_days %>% filter(count!=1 & rank !=1)
+sens_doac_90_days_normal<-rbind(sens_doac_90_days_normal,sens_doac_90_days_normal_2)
+sens_doac_90_days_normal <- sens_doac_90_days_normal %>%
+  mutate(
+    enddate = case_when(
+      !is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(90)),
+      TRUE ~ as.Date(enddate) + days(90))
+  )
+
+
+
+sens_doac_90_days_double<-sens_doac_90_days %>% filter(count==2) %>% group_by(patid) %>% mutate(next_start_date = lead(indexdate)) %>% filter(rank==1) %>%   mutate(enddate =  case_when(!is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(90),next_start_date),
+TRUE ~ pmin(as.Date(enddate) + days(90),next_start_date))) 
+sens_doac_90_days_normal<-sens_doac_90_days_normal %>%
+  select(-count, -rank)
+sens_doac_90_days_double<-sens_doac_90_days_double %>%
+  select(-count, -rank, -next_start_date)
+
+sens_doac_90_days<-rbind(sens_doac_90_days_double,sens_doac_90_days_normal)
+
+
+```
+
+
+
+#warfarin changed enddate
+Similarly, repeat for that of warfarin groups 
+```{r}
+
+sens_warfarin_7_days<-warfarin_ppi %>% group_by(patid) %>% mutate(count=n(),rank=rank(enddate)) %>% ungroup
+sens_warfarin_7_days_normal<-sens_warfarin_7_days %>% filter(count==1)
+sens_warfarin_7_days_normal_2<-sens_warfarin_7_days %>% filter(count!=1 & rank !=1)
+sens_warfarin_7_days_normal<-rbind(sens_warfarin_7_days_normal,sens_warfarin_7_days_normal_2)
+sens_warfarin_7_days_normal <- sens_warfarin_7_days_normal %>%
+  mutate(
+    enddate = case_when(
+      !is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(7)),
+      TRUE ~ as.Date(enddate) + days(7))
+  )
+
+
+
+sens_warfarin_7_days_double<-sens_warfarin_7_days %>% filter(count==2) %>% group_by(patid) %>% mutate(next_start_date = lead(indexdate)) %>% filter(rank==1) %>%   mutate(enddate =  case_when(!is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(7),next_start_date),
+TRUE ~ pmin(as.Date(enddate) + days(7),next_start_date))) 
+sens_warfarin_7_days_normal<-sens_warfarin_7_days_normal %>%
+  select(-count, -rank)
+sens_warfarin_7_days_double<-sens_warfarin_7_days_double %>%
+  select(-count, -rank, -next_start_date)
+
+sens_warfarin_7_days<-rbind(sens_warfarin_7_days_double,sens_warfarin_7_days_normal)
+
+
+sens_warfarin_14_days<-warfarin_ppi %>% group_by(patid) %>% mutate(count=n(),rank=rank(enddate)) %>% ungroup
+sens_warfarin_14_days_normal<-sens_warfarin_14_days %>% filter(count==1)
+sens_warfarin_14_days_normal_2<-sens_warfarin_14_days %>% filter(count!=1 & rank !=1)
+sens_warfarin_14_days_normal<-rbind(sens_warfarin_14_days_normal,sens_warfarin_14_days_normal_2)
+sens_warfarin_14_days_normal <- sens_warfarin_14_days_normal %>%
+  mutate(
+    enddate = case_when(
+      !is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(14)),
+      TRUE ~ as.Date(enddate) + days(14))
+  )
+
+
+
+sens_warfarin_14_days_double<-sens_warfarin_14_days %>% filter(count==2) %>% group_by(patid) %>% mutate(next_start_date = lead(indexdate)) %>% filter(rank==1) %>%   mutate(enddate =  case_when(!is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(14),next_start_date),
+TRUE ~ pmin(as.Date(enddate) + days(14),next_start_date))) 
+sens_warfarin_14_days_normal<-sens_warfarin_14_days_normal %>%
+  select(-count, -rank)
+sens_warfarin_14_days_double<-sens_warfarin_14_days_double %>%
+  select(-count, -rank, -next_start_date)
+
+sens_warfarin_14_days<-rbind(sens_warfarin_14_days_double,sens_warfarin_14_days_normal)
+
+
+
+
+
+sens_warfarin_30_days<-warfarin_ppi %>% group_by(patid) %>% mutate(count=n(),rank=rank(enddate)) %>% ungroup
+sens_warfarin_30_days_normal<-sens_warfarin_30_days %>% filter(count==1)
+sens_warfarin_30_days_normal_2<-sens_warfarin_30_days %>% filter(count!=1 & rank !=1)
+sens_warfarin_30_days_normal<-rbind(sens_warfarin_30_days_normal,sens_warfarin_30_days_normal_2)
+sens_warfarin_30_days_normal <- sens_warfarin_30_days_normal %>%
+  mutate(
+    enddate = case_when(
+      !is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(30)),
+      TRUE ~ as.Date(enddate) + days(30))
+  )
+
+
+
+sens_warfarin_30_days_double<-sens_warfarin_30_days %>% filter(count==2) %>% group_by(patid) %>% mutate(next_start_date = lead(indexdate)) %>% filter(rank==1) %>%   mutate(enddate =  case_when(!is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(30),next_start_date),
+TRUE ~ pmin(as.Date(enddate) + days(30),next_start_date))) 
+sens_warfarin_30_days_normal<-sens_warfarin_30_days_normal %>%
+  select(-count, -rank)
+sens_warfarin_30_days_double<-sens_warfarin_30_days_double %>%
+  select(-count, -rank, -next_start_date)
+
+sens_warfarin_30_days<-rbind(sens_warfarin_30_days_double,sens_warfarin_30_days_normal)
+
+
+
+
+
+sens_warfarin_90_days<-warfarin_ppi %>% group_by(patid) %>% mutate(count=n(),rank=rank(enddate)) %>% ungroup
+sens_warfarin_90_days_normal<-sens_warfarin_90_days %>% filter(count==1)
+sens_warfarin_90_days_normal_2<-sens_warfarin_90_days %>% filter(count!=1 & rank !=1)
+sens_warfarin_90_days_normal<-rbind(sens_warfarin_90_days_normal,sens_warfarin_90_days_normal_2)
+sens_warfarin_90_days_normal <- sens_warfarin_90_days_normal %>%
+  mutate(
+    enddate = case_when(
+      !is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(90)),
+      TRUE ~ as.Date(enddate) + days(90))
+  )
+
+
+
+sens_warfarin_90_days_double<-sens_warfarin_90_days %>% filter(count==2) %>% group_by(patid) %>% mutate(next_start_date = lead(indexdate)) %>% filter(rank==1) %>%   mutate(enddate =  case_when(!is.na(dod) ~ pmin(as.Date(dod), as.Date(enddate) + days(90),next_start_date),
+TRUE ~ pmin(as.Date(enddate) + days(90),next_start_date))) 
+sens_warfarin_90_days_normal<-sens_warfarin_90_days_normal %>%
+  select(-count, -rank)
+sens_warfarin_90_days_double<-sens_warfarin_90_days_double %>%
+  select(-count, -rank, -next_start_date)
+
+sens_warfarin_90_days<-rbind(sens_warfarin_90_days_double,sens_warfarin_90_days_normal)
+
+
+
+```
+
+
+#gi bleed different outcome warfarin
+Secondly, is concerning the treatment of the bleeding history. As mentioned, we have excluded the Aurum report  of patients with bleeding history in light of that they are likely to be a historic incident rather than a new report. we then exclude this concern, and extract the patients with or without bleeding history the same way . 
+
+```{r}
+
+
+Sens_warfarin_outcome_bleed_def<-warfarin_ppi %>% inner_join(all_incident,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% group_by(patid,indexdate) %>% mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% mutate(incident=1) %>% ungroup() %>% select(patid,indexdate,incident,obsdate)
+Sens_warfarin_outcome_bleed_def_no<-warfarin_ppi %>% left_join(Sens_warfarin_outcome_bleed_def,by=c("patid","indexdate")) %>% filter(is.na(incident)) %>% mutate(survival_time=enddate-indexdate) %>% mutate(incident=0)
+
+Sens_warfarin_outcome_bleed_def_yes<-warfarin_ppi %>% left_join(Sens_warfarin_outcome_bleed_def,by=c("patid","indexdate")) %>% filter(incident==1) %>% mutate(survival_time=obsdate-indexdate)
+
+Sens_warfarin_outcome_bleed_def<-rbind(Sens_warfarin_outcome_bleed_def_no,Sens_warfarin_outcome_bleed_def_yes)
+Sens_warfarin_outcome_bleed_def
+
+
+
+
+
+
+Sens_doac_outcome_bleed_def<-doac_ppi %>% inner_join(all_incident,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% group_by(patid,indexdate) %>% mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% mutate(incident=1) %>% ungroup() %>% select(patid,indexdate,incident,obsdate)
+Sens_doac_outcome_bleed_def_no<-doac_ppi %>% left_join(Sens_doac_outcome_bleed_def,by=c("patid","indexdate")) %>% filter(is.na(incident)) %>% mutate(survival_time=enddate-indexdate) %>% mutate(incident=0)
+
+Sens_doac_outcome_bleed_def_yes<-doac_ppi %>% left_join(Sens_doac_outcome_bleed_def,by=c("patid","indexdate")) %>% filter(incident==1) %>% mutate(survival_time=obsdate-indexdate)
+
+Sens_doac_outcome_bleed_def<-rbind(Sens_doac_outcome_bleed_def_no,Sens_doac_outcome_bleed_def_yes)
+
+
+
+```
+
+
+##incomplete case analysis. 
+firstly we inspect what covariates are missing, then add a column for yes or no for missing, then input the mean for continuous variables, and independently create a a factor for categorical variables 
+```{r}
+colSums(is.na(doac_ppi_outcome))
+sum(colSums(is.na(doac_ppi_outcome)) > 0)
+##dod, smoking status, bmi cat , diastolic_bp, systolic_bp, region, obsdate, and PS are missing 
+##what concerns us is smoking status, bmi_cat. diastolic_bp.systolic_bp, region 
+doac_ppi_outcome_incomplete <- doac_ppi_outcome %>%
+  mutate(smokstatus = case_when(
+    is.na(smokstatus) ~ as.factor("-1"),
+    TRUE ~ smokstatus
+  )) %>%
+  mutate(region = case_when(
+    is.na(region) ~ as.factor("-1"),
+    TRUE ~ region
+  )) %>%
+  mutate(bmicat = case_when(
+    is.na(bmicat) ~ as.factor("-1"),
+    TRUE ~ bmicat
+  )) %>%
+  mutate(diastolic_bp_miss = case_when(
+    is.na(diastolic_bp) ~ as.factor("1"),
+    TRUE ~ as.factor("0")
+  )) %>%
+  mutate(diastolic_bp = case_when(
+    is.na(diastolic_bp) ~ mean(diastolic_bp, na.rm = TRUE),
+    TRUE ~ diastolic_bp
+  )) %>%
+  mutate(systolic_bp_miss = case_when(
+    is.na(systolic_bp) ~ as.factor("1"),
+    TRUE ~ as.factor("0")
+  )) %>%
+  mutate(systolic_bp = case_when(
+    is.na(systolic_bp) ~ mean(systolic_bp, na.rm = TRUE),
+    TRUE ~ systolic_bp
+  ))
+
+
+colSums(is.na(warfarin_ppi_outcome))
+sum(colSums(is.na(warfarin_ppi_outcome)) > 0)
+##dod, smoking status, bmi cat , diastolic_bp, systolic_bp, region, obsdate, and PS are missing 
+##what concerns us is smoking status, bmi_cat. diastolic_bp.systolic_bp, region 
+warfarin_ppi_outcome_incomplete <- warfarin_ppi_outcome %>%
+  mutate(smokstatus = case_when(
+    is.na(smokstatus) ~ as.factor("-1"),
+    TRUE ~ smokstatus
+  )) %>%
+  mutate(region = case_when(
+    is.na(region) ~ as.factor("-1"),
+    TRUE ~ region
+  )) %>%
+  mutate(bmicat = case_when(
+    is.na(bmicat) ~ as.factor("-1"),
+    TRUE ~ bmicat
+  )) %>%
+  mutate(diastolic_bp_miss = case_when(
+    is.na(diastolic_bp) ~ as.factor("1"),
+    TRUE ~ as.factor("0")
+  )) %>%
+  mutate(diastolic_bp = case_when(
+    is.na(diastolic_bp) ~ mean(diastolic_bp, na.rm = TRUE),
+    TRUE ~ diastolic_bp
+  )) %>%
+  mutate(systolic_bp_miss = case_when(
+    is.na(systolic_bp) ~ as.factor("1"),
+    TRUE ~ as.factor("0")
+  )) %>%
+  mutate(systolic_bp = case_when(
+    is.na(systolic_bp) ~ mean(systolic_bp, na.rm = TRUE),
+    TRUE ~ systolic_bp
+  ))
+
+
+  
+```
+
+
+
+
+
+##sensitvity analysis regarding the change in ending date cutoff
+#7 days 
+```{r}
+
+sens_doac_7_days_bleed<-sens_doac_7_days %>% filter(GI_bleed==1) %>% select(patid,indexdate,dod,enddate)
+sens_doac_7_days_no_bleed <-sens_doac_7_days %>% filter(GI_bleed==0) %>% select(patid,indexdate,dod,enddate)
+#for no bleeding, take regardless of source
+sens_doac_7_days_no_bleed_outcome <-sens_doac_7_days_no_bleed %>% inner_join(all_incident,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>% group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+#for bleeding, take only HES
+sens_doac_7_days_bleed_outcome<-sens_doac_7_days_bleed %>% inner_join(all_incident_HES,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>%group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+
+sens_doac_7_days_bleed<-rbind(sens_doac_7_days_bleed_outcome,sens_doac_7_days_no_bleed_outcome)
+
+sens_doac_7_days_outcome<-sens_doac_7_days %>% left_join(sens_doac_7_days_bleed,by=c("patid","indexdate","enddate"))
+sens_doac_7_days_outcome_yes<-sens_doac_7_days_outcome %>% filter(incident==1)
+sens_doac_7_days_outcome_no<-sens_doac_7_days_outcome %>% filter(is.na(incident)) %>% mutate(incident=0) %>% mutate(survival_time=enddate-indexdate)
+sens_doac_7_days_outcome<-rbind(sens_doac_7_days_outcome_yes,sens_doac_7_days_outcome_no)
+doac_7_day_sen_PS_model <- glm(exposure
+                     ~age_index+
+                       as.factor(male)+
+                   as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= sens_doac_7_days_outcome) 
+# Display model coefficients
+summary(doac_7_day_sen_PS_model,conf.int = 0.99)
+sens_doac_7_days_outcome $PS <- doac_7_day_sen_PS_model %>% predict(sens_doac_7_days_outcome,  type = "response") 
+sens_doac_7_days_outcome <- sens_doac_7_days_outcome [!is.na(sens_doac_7_days_outcome $PS),]
+hist(sens_doac_7_days_outcome$PS[sens_doac_7_days_outcome$exposure==1],main="distribution of PS score for PPI+Doac group, 7 day extra follow up time",xlab="PS score for PPI+Doac group")
+hist(sens_doac_7_days_outcome$PS[sens_doac_7_days_outcome$exposure==0],main="distribution of PS score for Doac group",xlab="PS score for Doac group")
+summary(sens_doac_7_days_outcome$PS[sens_doac_7_days_outcome$exposure==1])
+summary(sens_doac_7_days_outcome$PS[sens_doac_7_days_outcome$exposure==0])
+
+
+sens_doac_7_days_outcome_exposure_range<-quantile(sens_doac_7_days_outcome$PS[sens_doac_7_days_outcome$exposure==1],c(0.05,0.95))
+
+doac_ppi_control_trimmed_7_day<-sens_doac_7_days_outcome %>% filter(exposure==0) %>% filter(between(PS,sens_doac_7_days_outcome_exposure_range[1],sens_doac_7_days_outcome_exposure_range[2]))
+sens_doac_7_days_outcome_control_range<-quantile(sens_doac_7_days_outcome$PS[sens_doac_7_days_outcome$exposure==0],c(0.05,0.95))
+doac_ppi_exposure_trimmed_7_day<-sens_doac_7_days_outcome %>% filter(exposure==1) %>% filter(between(PS,sens_doac_7_days_outcome_control_range[1],sens_doac_7_days_outcome_control_range[2]))
+                                                                                
+doac_ppi_trimmed_7_day<-rbind(doac_ppi_control_trimmed_7_day, doac_ppi_exposure_trimmed_7_day)
+
+
+doac_ppi_trimmed_7_day <- doac_ppi_trimmed_7_day %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_doac_7_days<- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = doac_ppi_trimmed_7_day, weights = doac_ppi_trimmed_7_day $weight)
+summary(weighted_cox_doac_7_days,conf.int = 0.99)
+
+
+```
+
+```{r}
+
+sens_warfarin_7_days_bleed<-sens_warfarin_7_days %>% filter(GI_bleed==1) %>% select(patid,indexdate,dod,enddate)
+sens_warfarin_7_days_no_bleed <-sens_warfarin_7_days %>% filter(GI_bleed==0) %>% select(patid,indexdate,dod,enddate)
+#for no bleeding, take regardless of source
+sens_warfarin_7_days_no_bleed_outcome <-sens_warfarin_7_days_no_bleed %>% inner_join(all_incident,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>% group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+#for bleeding, take only HES
+sens_warfarin_7_days_bleed_outcome<-sens_warfarin_7_days_bleed %>% inner_join(all_incident_HES,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>%group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+
+sens_warfarin_7_days_bleed<-rbind(sens_warfarin_7_days_bleed_outcome,sens_warfarin_7_days_no_bleed_outcome)
+
+sens_warfarin_7_days_outcome<-sens_warfarin_7_days %>% left_join(sens_warfarin_7_days_bleed,by=c("patid","indexdate","enddate"))
+sens_warfarin_7_days_outcome_yes<-sens_warfarin_7_days_outcome %>% filter(incident==1)
+sens_warfarin_7_days_outcome_no<-sens_warfarin_7_days_outcome %>% filter(is.na(incident)) %>% mutate(incident=0) %>% mutate(survival_time=enddate-indexdate)
+sens_warfarin_7_days_outcome<-rbind(sens_warfarin_7_days_outcome_yes,sens_warfarin_7_days_outcome_no)
+warfarin_7_day_sen_PS_model <- glm(exposure
+                     ~age_index+
+                       as.factor(male)+
+                   as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= sens_warfarin_7_days_outcome) 
+# Display model coefficients
+summary(warfarin_7_day_sen_PS_model,conf.int = 0.99)
+sens_warfarin_7_days_outcome $PS <- warfarin_7_day_sen_PS_model %>% predict(sens_warfarin_7_days_outcome,  type = "response") 
+sens_warfarin_7_days_outcome <- sens_warfarin_7_days_outcome [!is.na(sens_warfarin_7_days_outcome $PS),]
+hist(sens_warfarin_7_days_outcome$PS[sens_warfarin_7_days_outcome$exposure==1],main="distribution of PS score for PPI+Warfarin group, 7 day extra follow up time",xlab="PS score for PPI+Warfarin group")
+hist(sens_warfarin_7_days_outcome$PS[sens_warfarin_7_days_outcome$exposure==0],main="distribution of PS score for Warfarin group",xlab="PS score for Warfarin group")
+summary(sens_warfarin_7_days_outcome$PS[sens_warfarin_7_days_outcome$exposure==1])
+summary(sens_warfarin_7_days_outcome$PS[sens_warfarin_7_days_outcome$exposure==0])
+
+
+sens_warfarin_7_days_outcome_exposure_range<-quantile(sens_warfarin_7_days_outcome$PS[sens_warfarin_7_days_outcome$exposure==1],c(0.05,0.95))
+
+warfarin_ppi_control_trimmed_7_day<-sens_warfarin_7_days_outcome %>% filter(exposure==0) %>% filter(between(PS,sens_warfarin_7_days_outcome_exposure_range[1],sens_warfarin_7_days_outcome_exposure_range[2]))
+sens_warfarin_7_days_outcome_control_range<-quantile(sens_warfarin_7_days_outcome$PS[sens_warfarin_7_days_outcome$exposure==0],c(0.05,0.95))
+warfarin_ppi_exposure_trimmed_7_day<-sens_warfarin_7_days_outcome %>% filter(exposure==1) %>% filter(between(PS,sens_warfarin_7_days_outcome_control_range[1],sens_warfarin_7_days_outcome_control_range[2]))
+                                                                                
+warfarin_ppi_trimmed_7_day<-rbind(warfarin_ppi_control_trimmed_7_day, warfarin_ppi_exposure_trimmed_7_day)
+
+
+warfarin_ppi_trimmed_7_day <- warfarin_ppi_trimmed_7_day %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_warfarin_7_days<- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = warfarin_ppi_trimmed_7_day, weights = warfarin_ppi_trimmed_7_day $weight)
+summary(weighted_cox_warfarin_7_days,conf.int = 0.99)
+
+
+```
+
+##14 days 
+```{r}
+
+sens_doac_14_days_bleed<-sens_doac_14_days %>% filter(GI_bleed==1) %>% select(patid,indexdate,dod,enddate)
+sens_doac_14_days_no_bleed <-sens_doac_14_days %>% filter(GI_bleed==0) %>% select(patid,indexdate,dod,enddate)
+#for no bleeding, take regardless of source
+sens_doac_14_days_no_bleed_outcome <-sens_doac_14_days_no_bleed %>% inner_join(all_incident,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>% group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+#for bleeding, take only HES
+sens_doac_14_days_bleed_outcome<-sens_doac_14_days_bleed %>% inner_join(all_incident_HES,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>%group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+
+sens_doac_14_days_bleed<-rbind(sens_doac_14_days_bleed_outcome,sens_doac_14_days_no_bleed_outcome)
+
+sens_doac_14_days_outcome<-sens_doac_14_days %>% left_join(sens_doac_14_days_bleed,by=c("patid","indexdate","enddate"))
+sens_doac_14_days_outcome_yes<-sens_doac_14_days_outcome %>% filter(incident==1)
+sens_doac_14_days_outcome_no<-sens_doac_14_days_outcome %>% filter(is.na(incident)) %>% mutate(incident=0) %>% mutate(survival_time=enddate-indexdate)
+sens_doac_14_days_outcome<-rbind(sens_doac_14_days_outcome_yes,sens_doac_14_days_outcome_no)
+doac_14_day_sen_PS_model <- glm(exposure
+                     ~age_index+
+                       as.factor(male)+
+                   as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= sens_doac_14_days_outcome) 
+# Display model coefficients
+summary(doac_14_day_sen_PS_model,conf.int = 0.99)
+sens_doac_14_days_outcome $PS <- doac_14_day_sen_PS_model %>% predict(sens_doac_14_days_outcome,  type = "response") 
+sens_doac_14_days_outcome <- sens_doac_14_days_outcome [!is.na(sens_doac_14_days_outcome $PS),]
+hist(sens_doac_14_days_outcome$PS[sens_doac_14_days_outcome$exposure==1],main="distribution of PS score for PPI+Doac group, 14 day extra follow up time",xlab="PS score for PPI+Doac group")
+hist(sens_doac_14_days_outcome$PS[sens_doac_14_days_outcome$exposure==0],main="distribution of PS score for Doac group",xlab="PS score for Doac group")
+summary(sens_doac_14_days_outcome$PS[sens_doac_14_days_outcome$exposure==1])
+summary(sens_doac_14_days_outcome$PS[sens_doac_14_days_outcome$exposure==0])
+
+
+sens_doac_14_days_outcome_exposure_range<-quantile(sens_doac_14_days_outcome$PS[sens_doac_14_days_outcome$exposure==1],c(0.05,0.95))
+
+doac_ppi_control_trimmed_14_day<-sens_doac_14_days_outcome %>% filter(exposure==0) %>% filter(between(PS,sens_doac_14_days_outcome_exposure_range[1],sens_doac_14_days_outcome_exposure_range[2]))
+sens_doac_14_days_outcome_control_range<-quantile(sens_doac_14_days_outcome$PS[sens_doac_14_days_outcome$exposure==0],c(0.05,0.95))
+doac_ppi_exposure_trimmed_14_day<-sens_doac_14_days_outcome %>% filter(exposure==1) %>% filter(between(PS,sens_doac_14_days_outcome_control_range[1],sens_doac_14_days_outcome_control_range[2]))
+                                                                                
+doac_ppi_trimmed_14_day<-rbind(doac_ppi_control_trimmed_14_day, doac_ppi_exposure_trimmed_14_day)
+
+
+doac_ppi_trimmed_14_day <- doac_ppi_trimmed_14_day %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_doac_14_days<- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = doac_ppi_trimmed_14_day, weights = doac_ppi_trimmed_14_day $weight)
+summary(weighted_cox_doac_14_days,conf.int = 0.99)
+
+
+
+sens_warfarin_14_days_bleed<-sens_warfarin_14_days %>% filter(GI_bleed==1) %>% select(patid,indexdate,dod,enddate)
+sens_warfarin_14_days_no_bleed <-sens_warfarin_14_days %>% filter(GI_bleed==0) %>% select(patid,indexdate,dod,enddate)
+#for no bleeding, take regardless of source
+sens_warfarin_14_days_no_bleed_outcome <-sens_warfarin_14_days_no_bleed %>% inner_join(all_incident,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>% group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+#for bleeding, take only HES
+sens_warfarin_14_days_bleed_outcome<-sens_warfarin_14_days_bleed %>% inner_join(all_incident_HES,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>%group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+
+sens_warfarin_14_days_bleed<-rbind(sens_warfarin_14_days_bleed_outcome,sens_warfarin_14_days_no_bleed_outcome)
+
+sens_warfarin_14_days_outcome<-sens_warfarin_14_days %>% left_join(sens_warfarin_14_days_bleed,by=c("patid","indexdate","enddate"))
+sens_warfarin_14_days_outcome_yes<-sens_warfarin_14_days_outcome %>% filter(incident==1)
+sens_warfarin_14_days_outcome_no<-sens_warfarin_14_days_outcome %>% filter(is.na(incident)) %>% mutate(incident=0) %>% mutate(survival_time=enddate-indexdate)
+sens_warfarin_14_days_outcome<-rbind(sens_warfarin_14_days_outcome_yes,sens_warfarin_14_days_outcome_no)
+warfarin_14_day_sen_PS_model <- glm(exposure
+                     ~age_index+
+                       as.factor(male)+
+                   as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= sens_warfarin_14_days_outcome) 
+# Display model coefficients
+summary(warfarin_14_day_sen_PS_model,conf.int = 0.99)
+sens_warfarin_14_days_outcome $PS <- warfarin_14_day_sen_PS_model %>% predict(sens_warfarin_14_days_outcome,  type = "response") 
+sens_warfarin_14_days_outcome <- sens_warfarin_14_days_outcome [!is.na(sens_warfarin_14_days_outcome $PS),]
+hist(sens_warfarin_14_days_outcome$PS[sens_warfarin_14_days_outcome$exposure==1],main="distribution of PS score for PPI+Warfarin group, 14 day extra follow up time",xlab="PS score for PPI+Warfarin group")
+hist(sens_warfarin_14_days_outcome$PS[sens_warfarin_14_days_outcome$exposure==0],main="distribution of PS score for Warfarin group",xlab="PS score for Warfarin group")
+summary(sens_warfarin_14_days_outcome$PS[sens_warfarin_14_days_outcome$exposure==1])
+summary(sens_warfarin_14_days_outcome$PS[sens_warfarin_14_days_outcome$exposure==0])
+
+
+sens_warfarin_14_days_outcome_exposure_range<-quantile(sens_warfarin_14_days_outcome$PS[sens_warfarin_14_days_outcome$exposure==1],c(0.05,0.95))
+
+warfarin_ppi_control_trimmed_14_day<-sens_warfarin_14_days_outcome %>% filter(exposure==0) %>% filter(between(PS,sens_warfarin_14_days_outcome_exposure_range[1],sens_warfarin_14_days_outcome_exposure_range[2]))
+sens_warfarin_14_days_outcome_control_range<-quantile(sens_warfarin_14_days_outcome$PS[sens_warfarin_14_days_outcome$exposure==0],c(0.05,0.95))
+warfarin_ppi_exposure_trimmed_14_day<-sens_warfarin_14_days_outcome %>% filter(exposure==1) %>% filter(between(PS,sens_warfarin_14_days_outcome_control_range[1],sens_warfarin_14_days_outcome_control_range[2]))
+                                                                                
+warfarin_ppi_trimmed_14_day<-rbind(warfarin_ppi_control_trimmed_14_day, warfarin_ppi_exposure_trimmed_14_day)
+
+
+warfarin_ppi_trimmed_14_day <- warfarin_ppi_trimmed_14_day %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_warfarin_14_days<- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = warfarin_ppi_trimmed_14_day, weights = warfarin_ppi_trimmed_14_day $weight)
+summary(weighted_cox_warfarin_14_days,conf.int = 0.99)
+
+
+```
+
+
+##30days
+```{r}
+
+
+sens_doac_30_days_bleed<-sens_doac_30_days %>% filter(GI_bleed==1) %>% select(patid,indexdate,dod,enddate)
+sens_doac_30_days_no_bleed <-sens_doac_30_days %>% filter(GI_bleed==0) %>% select(patid,indexdate,dod,enddate)
+#for no bleeding, take regardless of source
+sens_doac_30_days_no_bleed_outcome <-sens_doac_30_days_no_bleed %>% inner_join(all_incident,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>% group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+#for bleeding, take only HES
+sens_doac_30_days_bleed_outcome<-sens_doac_30_days_bleed %>% inner_join(all_incident_HES,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>%group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+
+sens_doac_30_days_bleed<-rbind(sens_doac_30_days_bleed_outcome,sens_doac_30_days_no_bleed_outcome)
+
+sens_doac_30_days_outcome<-sens_doac_30_days %>% left_join(sens_doac_30_days_bleed,by=c("patid","indexdate","enddate"))
+sens_doac_30_days_outcome_yes<-sens_doac_30_days_outcome %>% filter(incident==1)
+sens_doac_30_days_outcome_no<-sens_doac_30_days_outcome %>% filter(is.na(incident)) %>% mutate(incident=0) %>% mutate(survival_time=enddate-indexdate)
+sens_doac_30_days_outcome<-rbind(sens_doac_30_days_outcome_yes,sens_doac_30_days_outcome_no)
+doac_30_day_sen_PS_model <- glm(exposure
+                     ~age_index+
+                       as.factor(male)+
+                   as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= sens_doac_30_days_outcome) 
+# Display model coefficients
+summary(doac_30_day_sen_PS_model,conf.int = 0.99)
+sens_doac_30_days_outcome $PS <- doac_30_day_sen_PS_model %>% predict(sens_doac_30_days_outcome,  type = "response") 
+sens_doac_30_days_outcome <- sens_doac_30_days_outcome [!is.na(sens_doac_30_days_outcome $PS),]
+hist(sens_doac_30_days_outcome$PS[sens_doac_30_days_outcome$exposure==1],main="distribution of PS score for PPI+Doac group, 30 day extra follow up time",xlab="PS score for PPI+Doac group")
+hist(sens_doac_30_days_outcome$PS[sens_doac_30_days_outcome$exposure==0],main="distribution of PS score for Doac group",xlab="PS score for Doac group")
+summary(sens_doac_30_days_outcome$PS[sens_doac_30_days_outcome$exposure==1])
+summary(sens_doac_30_days_outcome$PS[sens_doac_30_days_outcome$exposure==0])
+
+
+sens_doac_30_days_outcome_exposure_range<-quantile(sens_doac_30_days_outcome$PS[sens_doac_30_days_outcome$exposure==1],c(0.05,0.95))
+
+doac_ppi_control_trimmed_30_day<-sens_doac_30_days_outcome %>% filter(exposure==0) %>% filter(between(PS,sens_doac_30_days_outcome_exposure_range[1],sens_doac_30_days_outcome_exposure_range[2]))
+sens_doac_30_days_outcome_control_range<-quantile(sens_doac_30_days_outcome$PS[sens_doac_30_days_outcome$exposure==0],c(0.05,0.95))
+doac_ppi_exposure_trimmed_30_day<-sens_doac_30_days_outcome %>% filter(exposure==1) %>% filter(between(PS,sens_doac_30_days_outcome_control_range[1],sens_doac_30_days_outcome_control_range[2]))
+                                                                                
+doac_ppi_trimmed_30_day<-rbind(doac_ppi_control_trimmed_30_day, doac_ppi_exposure_trimmed_30_day)
+
+
+doac_ppi_trimmed_30_day <- doac_ppi_trimmed_30_day %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_doac_30_days<- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = doac_ppi_trimmed_30_day, weights = doac_ppi_trimmed_30_day $weight)
+summary(weighted_cox_doac_30_days,conf.int = 0.99)
+
+
+
+sens_warfarin_30_days_bleed<-sens_warfarin_30_days %>% filter(GI_bleed==1) %>% select(patid,indexdate,dod,enddate)
+sens_warfarin_30_days_no_bleed <-sens_warfarin_30_days %>% filter(GI_bleed==0) %>% select(patid,indexdate,dod,enddate)
+#for no bleeding, take regardless of source
+sens_warfarin_30_days_no_bleed_outcome <-sens_warfarin_30_days_no_bleed %>% inner_join(all_incident,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>% group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+#for bleeding, take only HES
+sens_warfarin_30_days_bleed_outcome<-sens_warfarin_30_days_bleed %>% inner_join(all_incident_HES,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>%group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+
+sens_warfarin_30_days_bleed<-rbind(sens_warfarin_30_days_bleed_outcome,sens_warfarin_30_days_no_bleed_outcome)
+
+sens_warfarin_30_days_outcome<-sens_warfarin_30_days %>% left_join(sens_warfarin_30_days_bleed,by=c("patid","indexdate","enddate"))
+sens_warfarin_30_days_outcome_yes<-sens_warfarin_30_days_outcome %>% filter(incident==1)
+sens_warfarin_30_days_outcome_no<-sens_warfarin_30_days_outcome %>% filter(is.na(incident)) %>% mutate(incident=0) %>% mutate(survival_time=enddate-indexdate)
+sens_warfarin_30_days_outcome<-rbind(sens_warfarin_30_days_outcome_yes,sens_warfarin_30_days_outcome_no)
+warfarin_30_day_sen_PS_model <- glm(exposure
+                     ~age_index+
+                       as.factor(male)+
+                   as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= sens_warfarin_30_days_outcome) 
+# Display model coefficients
+summary(warfarin_30_day_sen_PS_model,conf.int = 0.99)
+sens_warfarin_30_days_outcome $PS <- warfarin_30_day_sen_PS_model %>% predict(sens_warfarin_30_days_outcome,  type = "response") 
+sens_warfarin_30_days_outcome <- sens_warfarin_30_days_outcome [!is.na(sens_warfarin_30_days_outcome $PS),]
+hist(sens_warfarin_30_days_outcome$PS[sens_warfarin_30_days_outcome$exposure==1],main="distribution of PS score for PPI+Warfarin group, 30 day extra follow up time",xlab="PS score for PPI+Warfarin group")
+hist(sens_warfarin_30_days_outcome$PS[sens_warfarin_30_days_outcome$exposure==0],main="distribution of PS score for Warfarin group",xlab="PS score for Warfarin group")
+summary(sens_warfarin_30_days_outcome$PS[sens_warfarin_30_days_outcome$exposure==1])
+summary(sens_warfarin_30_days_outcome$PS[sens_warfarin_30_days_outcome$exposure==0])
+
+
+sens_warfarin_30_days_outcome_exposure_range<-quantile(sens_warfarin_30_days_outcome$PS[sens_warfarin_30_days_outcome$exposure==1],c(0.05,0.95))
+
+warfarin_ppi_control_trimmed_30_day<-sens_warfarin_30_days_outcome %>% filter(exposure==0) %>% filter(between(PS,sens_warfarin_30_days_outcome_exposure_range[1],sens_warfarin_30_days_outcome_exposure_range[2]))
+sens_warfarin_30_days_outcome_control_range<-quantile(sens_warfarin_30_days_outcome$PS[sens_warfarin_30_days_outcome$exposure==0],c(0.05,0.95))
+warfarin_ppi_exposure_trimmed_30_day<-sens_warfarin_30_days_outcome %>% filter(exposure==1) %>% filter(between(PS,sens_warfarin_30_days_outcome_control_range[1],sens_warfarin_30_days_outcome_control_range[2]))
+                                                                                
+warfarin_ppi_trimmed_30_day<-rbind(warfarin_ppi_control_trimmed_30_day, warfarin_ppi_exposure_trimmed_30_day)
+
+
+warfarin_ppi_trimmed_30_day <- warfarin_ppi_trimmed_30_day %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_warfarin_30_days<- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = warfarin_ppi_trimmed_30_day, weights = warfarin_ppi_trimmed_30_day $weight)
+summary(weighted_cox_warfarin_30_days,conf.int = 0.99)
+
+
+```
+
+##90 days 
+```{r}
+
+
+sens_doac_90_days_bleed<-sens_doac_90_days %>% filter(GI_bleed==1) %>% select(patid,indexdate,dod,enddate)
+sens_doac_90_days_no_bleed <-sens_doac_90_days %>% filter(GI_bleed==0) %>% select(patid,indexdate,dod,enddate)
+#for no bleeding, take regardless of source
+sens_doac_90_days_no_bleed_outcome <-sens_doac_90_days_no_bleed %>% inner_join(all_incident,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>% group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+#for bleeding, take only HES
+sens_doac_90_days_bleed_outcome<-sens_doac_90_days_bleed %>% inner_join(all_incident_HES,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>%group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+
+sens_doac_90_days_bleed<-rbind(sens_doac_90_days_bleed_outcome,sens_doac_90_days_no_bleed_outcome)
+
+sens_doac_90_days_outcome<-sens_doac_90_days %>% left_join(sens_doac_90_days_bleed,by=c("patid","indexdate","enddate"))
+sens_doac_90_days_outcome_yes<-sens_doac_90_days_outcome %>% filter(incident==1)
+sens_doac_90_days_outcome_no<-sens_doac_90_days_outcome %>% filter(is.na(incident)) %>% mutate(incident=0) %>% mutate(survival_time=enddate-indexdate)
+sens_doac_90_days_outcome<-rbind(sens_doac_90_days_outcome_yes,sens_doac_90_days_outcome_no)
+doac_90_day_sen_PS_model <- glm(exposure
+                     ~age_index+
+                       as.factor(male)+
+                   as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= sens_doac_90_days_outcome) 
+# Display model coefficients
+summary(doac_90_day_sen_PS_model,conf.int = 0.99)
+sens_doac_90_days_outcome $PS <- doac_90_day_sen_PS_model %>% predict(sens_doac_90_days_outcome,  type = "response") 
+sens_doac_90_days_outcome <- sens_doac_90_days_outcome [!is.na(sens_doac_90_days_outcome $PS),]
+hist(sens_doac_90_days_outcome$PS[sens_doac_90_days_outcome$exposure==1],main="distribution of PS score for PPI+Doac group, 90 day extra follow up time",xlab="PS score for PPI+Doac group")
+hist(sens_doac_90_days_outcome$PS[sens_doac_90_days_outcome$exposure==0],main="distribution of PS score for Doac group",xlab="PS score for Doac group")
+summary(sens_doac_90_days_outcome$PS[sens_doac_90_days_outcome$exposure==1])
+summary(sens_doac_90_days_outcome$PS[sens_doac_90_days_outcome$exposure==0])
+
+
+sens_doac_90_days_outcome_exposure_range<-quantile(sens_doac_90_days_outcome$PS[sens_doac_90_days_outcome$exposure==1],c(0.05,0.95))
+
+doac_ppi_control_trimmed_90_day<-sens_doac_90_days_outcome %>% filter(exposure==0) %>% filter(between(PS,sens_doac_90_days_outcome_exposure_range[1],sens_doac_90_days_outcome_exposure_range[2]))
+sens_doac_90_days_outcome_control_range<-quantile(sens_doac_90_days_outcome$PS[sens_doac_90_days_outcome$exposure==0],c(0.05,0.95))
+doac_ppi_exposure_trimmed_90_day<-sens_doac_90_days_outcome %>% filter(exposure==1) %>% filter(between(PS,sens_doac_90_days_outcome_control_range[1],sens_doac_90_days_outcome_control_range[2]))
+                                                                                
+doac_ppi_trimmed_90_day<-rbind(doac_ppi_control_trimmed_90_day, doac_ppi_exposure_trimmed_90_day)
+
+
+doac_ppi_trimmed_90_day <- doac_ppi_trimmed_90_day %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_doac_90_days<- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = doac_ppi_trimmed_90_day, weights = doac_ppi_trimmed_90_day $weight)
+summary(weighted_cox_doac_90_days,conf.int = 0.99)
+
+
+
+sens_warfarin_90_days_bleed<-sens_warfarin_90_days %>% filter(GI_bleed==1) %>% select(patid,indexdate,dod,enddate)
+sens_warfarin_90_days_no_bleed <-sens_warfarin_90_days %>% filter(GI_bleed==0) %>% select(patid,indexdate,dod,enddate)
+#for no bleeding, take regardless of source
+sens_warfarin_90_days_no_bleed_outcome <-sens_warfarin_90_days_no_bleed %>% inner_join(all_incident,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>% group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+#for bleeding, take only HES
+sens_warfarin_90_days_bleed_outcome<-sens_warfarin_90_days_bleed %>% inner_join(all_incident_HES,by="patid") %>% filter(between(obsdate,indexdate,enddate)) %>% filter(obsdate>indexdate) %>% select(patid,indexdate,enddate,obsdate) %>% mutate(incident=1) %>% mutate(survival_time=obsdate-indexdate) %>%group_by(patid,indexdate) %>%  mutate(rank=rank(obsdate)) %>% filter(rank==1) %>% select(patid,indexdate,enddate,obsdate,incident,survival_time)
+
+sens_warfarin_90_days_bleed<-rbind(sens_warfarin_90_days_bleed_outcome,sens_warfarin_90_days_no_bleed_outcome)
+
+sens_warfarin_90_days_outcome<-sens_warfarin_90_days %>% left_join(sens_warfarin_90_days_bleed,by=c("patid","indexdate","enddate"))
+sens_warfarin_90_days_outcome_yes<-sens_warfarin_90_days_outcome %>% filter(incident==1)
+sens_warfarin_90_days_outcome_no<-sens_warfarin_90_days_outcome %>% filter(is.na(incident)) %>% mutate(incident=0) %>% mutate(survival_time=enddate-indexdate)
+sens_warfarin_90_days_outcome<-rbind(sens_warfarin_90_days_outcome_yes,sens_warfarin_90_days_outcome_no)
+warfarin_90_day_sen_PS_model <- glm(exposure
+                     ~age_index+
+                       as.factor(male)+
+                   as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= sens_warfarin_90_days_outcome) 
+# Display model coefficients
+summary(warfarin_90_day_sen_PS_model,conf.int = 0.99)
+sens_warfarin_90_days_outcome $PS <- warfarin_90_day_sen_PS_model %>% predict(sens_warfarin_90_days_outcome,  type = "response") 
+sens_warfarin_90_days_outcome <- sens_warfarin_90_days_outcome [!is.na(sens_warfarin_90_days_outcome $PS),]
+hist(sens_warfarin_90_days_outcome$PS[sens_warfarin_90_days_outcome$exposure==1],main="distribution of PS score for PPI+Warfarin group, 90 day extra follow up time",xlab="PS score for PPI+Warfarin group")
+hist(sens_warfarin_90_days_outcome$PS[sens_warfarin_90_days_outcome$exposure==0],main="distribution of PS score for Warfarin group",xlab="PS score for Warfarin group")
+summary(sens_warfarin_90_days_outcome$PS[sens_warfarin_90_days_outcome$exposure==1])
+summary(sens_warfarin_90_days_outcome$PS[sens_warfarin_90_days_outcome$exposure==0])
+
+
+sens_warfarin_90_days_outcome_exposure_range<-quantile(sens_warfarin_90_days_outcome$PS[sens_warfarin_90_days_outcome$exposure==1],c(0.05,0.95))
+
+warfarin_ppi_control_trimmed_90_day<-sens_warfarin_90_days_outcome %>% filter(exposure==0) %>% filter(between(PS,sens_warfarin_90_days_outcome_exposure_range[1],sens_warfarin_90_days_outcome_exposure_range[2]))
+sens_warfarin_90_days_outcome_control_range<-quantile(sens_warfarin_90_days_outcome$PS[sens_warfarin_90_days_outcome$exposure==0],c(0.05,0.95))
+warfarin_ppi_exposure_trimmed_90_day<-sens_warfarin_90_days_outcome %>% filter(exposure==1) %>% filter(between(PS,sens_warfarin_90_days_outcome_control_range[1],sens_warfarin_90_days_outcome_control_range[2]))
+                                                                                
+warfarin_ppi_trimmed_90_day<-rbind(warfarin_ppi_control_trimmed_90_day, warfarin_ppi_exposure_trimmed_90_day)
+
+
+warfarin_ppi_trimmed_90_day <- warfarin_ppi_trimmed_90_day %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_warfarin_90_days<- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = warfarin_ppi_trimmed_90_day, weights = warfarin_ppi_trimmed_90_day $weight)
+summary(weighted_cox_warfarin_90_days,conf.int = 0.99)
+
+
+```
+
+
+
+##for changed definition for bleeding group
+```{r}
+doac_PS_model_Outcome_def <- glm(exposure
+                     ~age_index+male+               as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= Sens_doac_outcome_bleed_def
+) 
+
+# Display model coefficients
+summary(doac_PS_model_Outcome_def,conf.int = 0.99)
+Sens_doac_outcome_bleed_def$PS <- doac_PS_model_Outcome_def %>% predict(Sens_doac_outcome_bleed_def,  type = "response") 
+Sens_doac_outcome_bleed_def <- Sens_doac_outcome_bleed_def [!is.na(Sens_doac_outcome_bleed_def $PS),]
+doac_ppi_Outcome_def_complete<- Sens_doac_outcome_bleed_def
+
+doac_ppi_Outcome_def_complete_control<-doac_ppi_Outcome_def_complete %>% filter(exposure==0)
+doac_ppi_Outcome_def_complete_control_range<-quantile(doac_ppi_Outcome_def_complete_control$PS,c(0.05,0.95))
+doac_ppi_Outcome_def_complete_exposure<-doac_ppi_Outcome_def_complete %>% filter(exposure==1)
+doac_ppi_Outcome_def_complete_exposure_range<-quantile(doac_ppi_Outcome_def_complete_exposure$PS,c(0.05,0.95))
+doac_ppi_Outcome_def_complete_control <-doac_ppi_Outcome_def_complete_control %>% filter(between(PS,doac_ppi_Outcome_def_complete_exposure_range[1],doac_ppi_Outcome_def_complete_exposure_range[2]))
+doac_ppi_Outcome_def_complete_exposure <-doac_ppi_Outcome_def_complete_exposure %>% filter(between(PS,doac_ppi_Outcome_def_complete_control_range[1],doac_ppi_Outcome_def_complete_control_range[2]))
+doac_ppi_Outcome_def<-rbind(doac_ppi_Outcome_def_complete_exposure,doac_ppi_Outcome_def_complete_control)
+doac_ppi_Outcome_def<-doac_ppi_Outcome_def %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_doac_Outcome_def <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = doac_ppi_Outcome_def, weights = doac_ppi_Outcome_def$weight)
+summary(weighted_cox_doac_Outcome_def,conf.int = 0.99)
+summary_doac_weighted_Outcome_def<-summary(weighted_cox_doac_Outcome_def)
+summary_doac_weighted_Outcome_def<-c(summary_doac_weighted_Outcome_def$coefficient[1],summary_doac_weighted_Outcome_def$coefficient[1,3])
+
+
+
+
+
+```
+
+
+```{r}
+warfarin_PS_model_Outcome_def <- glm(exposure
+                     ~age_index+male+               as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= Sens_warfarin_outcome_bleed_def
+) 
+
+# Display model coefficients
+summary(warfarin_PS_model_Outcome_def,conf.int = 0.99)
+Sens_warfarin_outcome_bleed_def$PS <- warfarin_PS_model_Outcome_def %>% predict(Sens_warfarin_outcome_bleed_def,  type = "response") 
+Sens_warfarin_outcome_bleed_def <- Sens_warfarin_outcome_bleed_def [!is.na(Sens_warfarin_outcome_bleed_def $PS),]
+warfarin_ppi_Outcome_def_complete<- Sens_warfarin_outcome_bleed_def
+
+warfarin_ppi_Outcome_def_complete_control<-warfarin_ppi_Outcome_def_complete %>% filter(exposure==0)
+warfarin_ppi_Outcome_def_complete_control_range<-quantile(warfarin_ppi_Outcome_def_complete_control$PS,c(0.05,0.95))
+warfarin_ppi_Outcome_def_complete_exposure<-warfarin_ppi_Outcome_def_complete %>% filter(exposure==1)
+warfarin_ppi_Outcome_def_complete_exposure_range<-quantile(warfarin_ppi_Outcome_def_complete_exposure$PS,c(0.05,0.95))
+warfarin_ppi_Outcome_def_complete_control <-warfarin_ppi_Outcome_def_complete_control %>% filter(between(PS,warfarin_ppi_Outcome_def_complete_exposure_range[1],warfarin_ppi_Outcome_def_complete_exposure_range[2]))
+warfarin_ppi_Outcome_def_complete_exposure <-warfarin_ppi_Outcome_def_complete_exposure %>% filter(between(PS,warfarin_ppi_Outcome_def_complete_control_range[1],warfarin_ppi_Outcome_def_complete_control_range[2]))
+warfarin_ppi_Outcome_def<-rbind(warfarin_ppi_Outcome_def_complete_exposure,warfarin_ppi_Outcome_def_complete_control)
+warfarin_ppi_Outcome_def<-warfarin_ppi_Outcome_def %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_warfarin_Outcome_def <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = warfarin_ppi_Outcome_def, weights = warfarin_ppi_Outcome_def$weight)
+summary(weighted_cox_warfarin_Outcome_def,conf.int = 0.99)
+summary_warfarin_weighted_Outcome_def<-summary(weighted_cox_warfarin_Outcome_def)
+summary_warfarin_weighted_Outcome_def<-c(summary_warfarin_weighted_Outcome_def$coefficient[1],summary_warfarin_weighted_Outcome_def$coefficient[1,3])
+
+
+
+```
+
+
+##for incomplete cases 
+```{r}
+doac_PS_model_Incomplete <- glm(exposure
+                     ~age_index+male+               as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+ diastolic_bp_miss+ systolic_bp_miss+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= doac_ppi_outcome_incomplete
+) 
+Sens_doac_outcome_bleed_def<-doac_ppi_outcome_incomplete
+
+# Display model coefficients
+summary(doac_PS_model_Incomplete,conf.int = 0.99)
+Sens_doac_outcome_bleed_def$PS <- doac_PS_model_Incomplete %>% predict(Sens_doac_outcome_bleed_def,  type = "response") 
+Sens_doac_outcome_bleed_def <- Sens_doac_outcome_bleed_def [!is.na(Sens_doac_outcome_bleed_def $PS),]
+doac_ppi_Incomplete_complete<- Sens_doac_outcome_bleed_def
+hist(Sens_doac_outcome_bleed_def $PS[Sens_doac_outcome_bleed_def $exposure==1],main="distribution of PS score for PPI+Doac group, changed outcome definition, Incompletes only",xlab="PS score for PPI+Doac group")
+hist(doac_ppi_Incomplete_complete$PS[doac_ppi_Incomplete_complete$exposure==0],main="distribution of PS score for Doac group, Incompletes only",xlab="PS score for Doac group")
+summary(doac_ppi_Incomplete_complete$PS[doac_ppi_Incomplete_complete$exposure==1])
+summary(doac_ppi_Incomplete_complete$PS[doac_ppi_Incomplete_complete$exposure==0])
+doac_ppi_Incomplete_complete_control<-doac_ppi_Incomplete_complete %>% filter(exposure==0)
+doac_ppi_Incomplete_complete_control_range<-quantile(doac_ppi_Incomplete_complete_control$PS,c(0.05,0.95))
+doac_ppi_Incomplete_complete_exposure<-doac_ppi_Incomplete_complete %>% filter(exposure==1)
+doac_ppi_Incomplete_complete_exposure_range<-quantile(doac_ppi_Incomplete_complete_exposure$PS,c(0.05,0.95))
+doac_ppi_Incomplete_complete_control <-doac_ppi_Incomplete_complete_control %>% filter(between(PS,doac_ppi_Incomplete_complete_exposure_range[1],doac_ppi_Incomplete_complete_exposure_range[2]))
+doac_ppi_Incomplete_complete_exposure <-doac_ppi_Incomplete_complete_exposure %>% filter(between(PS,doac_ppi_Incomplete_complete_control_range[1],doac_ppi_Incomplete_complete_control_range[2]))
+doac_ppi_Incomplete<-rbind(doac_ppi_Incomplete_complete_exposure,doac_ppi_Incomplete_complete_control)
+doac_ppi_Incomplete<-doac_ppi_Incomplete %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_doac_Incomplete <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = doac_ppi_Incomplete, weights = doac_ppi_Incomplete$weight)
+summary(weighted_cox_doac_Incomplete,conf.int = 0.99)
+summary_doac_weighted_Incomplete<-summary(weighted_cox_doac_Incomplete)
+summary_doac_weighted_Incomplete<-c(summary_doac_weighted_Incomplete$coefficient[1],summary_doac_weighted_Incomplete$coefficient[1,3])
+
+
+
+
+```
+
+```{r}
+
+warfarin_PS_model_Incomplete <- glm(exposure
+                     ~age_index+male+               as.factor(smokstatus)+as.factor(bmicat)+as.factor(alcohol)+ diastolic_bp_miss+ systolic_bp_miss+systolic_bp+diastolic_bp+ckd_base+imd+copd_base+hf_base+ihd_base+peptic_ulcer_base+pad_base+af_base+vte_base+all_bleed_base+stroke_tia_base+ischaemic_stroke_base+hypertension_base+liver_disease_base+MI_base+dm_insulin_base+GI_bleed+aspirin+antiplatelet+antidepressant+anticonvulsant+nsaid+oralsteroid+all_macrolide+gpvisit_num+region+polypharmacy_main, family=binomial(), data= warfarin_ppi_outcome_incomplete
+) 
+Sens_warfarin_outcome_bleed_def<-warfarin_ppi_outcome_incomplete
+
+# Display model coefficients
+summary(warfarin_PS_model_Incomplete,conf.int = 0.99)
+Sens_warfarin_outcome_bleed_def$PS <- warfarin_PS_model_Incomplete %>% predict(Sens_warfarin_outcome_bleed_def,  type = "response") 
+Sens_warfarin_outcome_bleed_def <- Sens_warfarin_outcome_bleed_def [!is.na(Sens_warfarin_outcome_bleed_def $PS),]
+warfarin_ppi_Incomplete_complete<- Sens_warfarin_outcome_bleed_def
+hist(Sens_warfarin_outcome_bleed_def $PS[Sens_warfarin_outcome_bleed_def $exposure==1],main="distribution of PS score for PPI+Warfarin group, changed outcome definition, Incompletes only",xlab="PS score for PPI+Warfarin group")
+hist(warfarin_ppi_Incomplete_complete$PS[warfarin_ppi_Incomplete_complete$exposure==0],main="distribution of PS score for Warfarin group, Incompletes only",xlab="PS score for Warfarin group")
+summary(warfarin_ppi_Incomplete_complete$PS[warfarin_ppi_Incomplete_complete$exposure==1])
+summary(warfarin_ppi_Incomplete_complete$PS[warfarin_ppi_Incomplete_complete$exposure==0])
+warfarin_ppi_Incomplete_complete_control<-warfarin_ppi_Incomplete_complete %>% filter(exposure==0)
+warfarin_ppi_Incomplete_complete_control_range<-quantile(warfarin_ppi_Incomplete_complete_control$PS,c(0.05,0.95))
+warfarin_ppi_Incomplete_complete_exposure<-warfarin_ppi_Incomplete_complete %>% filter(exposure==1)
+warfarin_ppi_Incomplete_complete_exposure_range<-quantile(warfarin_ppi_Incomplete_complete_exposure$PS,c(0.05,0.95))
+warfarin_ppi_Incomplete_complete_control <-warfarin_ppi_Incomplete_complete_control %>% filter(between(PS,warfarin_ppi_Incomplete_complete_exposure_range[1],warfarin_ppi_Incomplete_complete_exposure_range[2]))
+warfarin_ppi_Incomplete_complete_exposure <-warfarin_ppi_Incomplete_complete_exposure %>% filter(between(PS,warfarin_ppi_Incomplete_complete_control_range[1],warfarin_ppi_Incomplete_complete_control_range[2]))
+warfarin_ppi_Incomplete<-rbind(warfarin_ppi_Incomplete_complete_exposure,warfarin_ppi_Incomplete_complete_control)
+warfarin_ppi_Incomplete<-warfarin_ppi_Incomplete %>% mutate(weight=case_when(
+  exposure==1~1/PS,
+  exposure==0~1/(1-PS)
+)) %>% filter(weight<10) 
+
+weighted_cox_warfarin_Incomplete <- coxph(Surv(survival_time, incident) ~ exposure+age_index+male+gpvisit_num+polypharmacy_main, data = warfarin_ppi_Incomplete, weights = warfarin_ppi_Incomplete$weight)
+summary(weighted_cox_warfarin_Incomplete,conf.int = 0.99)
+summary_warfarin_weighted_Incomplete<-summary(weighted_cox_warfarin_Incomplete)
+summary_warfarin_weighted_Incomplete<-c(summary_warfarin_weighted_Incomplete$coefficient[1],summary_warfarin_weighted_Incomplete$coefficient[1,3])
+
+
+```
+
+
+
+
