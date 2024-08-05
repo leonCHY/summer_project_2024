@@ -11,18 +11,33 @@ but since the the datasets are not to be shares, such a option is not available.
 
 Requirment and dependencies: 
 R version 4.3.2
+
 library(here)
+
 library(haven)
+
 library(lubridate)
+
 library(tableone) 
+
 library(ggplot2)
+
 library(survival)
+
 library(survminer)
+
 library(parallel)
+
 library(doParallel)
+
 library(timereg)
+
 library(matrixStats) 
+
 library(tidysmd)
+
 library(cobalt)
+
 library(multcomp)
+
 library(dplyr)
