@@ -7,7 +7,7 @@ The datasets, orginally encoded as "warfarin_ppi.dta", "doac_ppi.dta","aurum_hes
 
 Running the script: 
 therotically, the R is in the R markdown format, the by pressing running all blocks below, the script should start running and produce all the materials required for the analysis. 
-but since the the datasets are not to be shares, such a option is not available. 
+but since the the datasets and the code lists are not to be shared per the data sharing agreement, such a option is not available. 
 
 Requirment and dependencies: 
 R version 4.3.2
