@@ -5,7 +5,7 @@ Contents:
 The datasets, orginally encoded as "warfarin_ppi.dta", "doac_ppi.dta","aurum_hes_gi_bleed_dx.dta", "aurum_gi_bleed_dx.dta", are not to be shared per the data sharing protocol. 
 
 Running the script: 
-therotically, the R is in the R markdown format, the by pressing running all blocks below, the script should start running and produce all the materials required for the analysis. 
+therotically, the script is in the R markdown format, the by pressing running all blocks below, the script should start running and produce all the materials required for the analysis. 
 but since the the datasets and the code lists are not to be shared per the data sharing agreement, such a option is not available. 
 
 Requirment and dependencies: 
