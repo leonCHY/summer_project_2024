@@ -8,7 +8,8 @@ Running the script:
 therotically, the script is in the R markdown format, the by pressing running all blocks below, the script should start running and produce all the materials required for the analysis. 
 but since the the datasets and the code lists are not to be shared per the data sharing agreement, such a option is not available. 
 
-Requirment and dependencies: 
+PLease ensure the following requirment and dependencies are present: 
+
 R version 4.3.2
 
 library(here)
